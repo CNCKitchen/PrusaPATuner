@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+*.spec
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# Editors / IDEs
+.idea/
+.vscode/
+
+# Claude Code local state (may contain printer IPs, passwords, API keys)
+.claude/
+CLAUDE.md
+.claude.json
+
+# Logs and UDP captures
+*.log
+captures/
+
+# Run artefacts — raw loadcell timeseries, exports, replays
+runs/
+*.npz
+*.xlsx
+
+# Firmware blobs — not redistributed; stock Buddy firmware streams the
+# metrics this tool needs, no custom build required.
+*.bbf
+
+# Personal scratch / probe scripts (anything prefixed with `_` is local-only)
+_*.py
+
+# User config (printer IP, PrusaLink password) lives outside the repo
+# (~/.prusa_pa_tuner/ on Linux/macOS, %APPDATA%/PrusaPATuner on Windows),
+# but ignore any stray local copy here just in case:
+config.json
+.env
+.env.*
+secrets*.json

@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Prusa PA Tuner</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Prusa PA Tuner</h1>
+    <span class="subtitle">Auto-tune Linear Advance on the Core One via the nozzle loadcell.</span>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>1. Printer</h2>
+      <div class="row">
+        <label>Host / IP <input id="printer_host" placeholder="192.168.1.42" /></label>
+        <label>User <input id="printer_user" value="maker" /></label>
+        <label>PrusaLink password <input id="printer_password" type="password" placeholder="Core One — Settings → Network → PrusaLink" /></label>
+      </div>
+      <div class="row">
+        <label class="wide">Legacy API key (older Buddy only — leave blank if using password)
+          <input id="printer_api_key" type="password" />
+        </label>
+        <label>UDP port <input id="udp_port" type="number" value="8514" /></label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>2. Filament &amp; temps</h2>
+      <div class="row">
+        <label>Label <input id="filament_label" value="PLA" /></label>
+        <label>Test temp °C <input id="nozzle_temp" type="number" step="1" value="215" /></label>
+        <label>Preheat °C <input id="preheat_temp" type="number" step="1" value="225" /></label>
+        <label>Nozzle Ø <input id="nozzle_diameter" type="number" step="0.1" value="0.4" /></label>
+        <label>Filament Ø <input id="filament_diameter" type="number" step="0.01" value="1.75" /></label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>3. Sweep parameters</h2>
+      <div class="row">
+        <label>Slow flow (mm³/s) <input id="slow_flow_mm3_s" type="number" step="0.01" value="1.92" /></label>
+        <label>Slow volume (mm³) <input id="slow_volume_mm3" type="number" step="0.01" value="1.92" /></label>
+        <label>Fast flow (mm³/s) <input id="fast_flow_mm3_s" type="number" step="0.01" value="19.24" /></label>
+        <label>Fast volume (mm³) <input id="fast_volume_mm3" type="number" step="0.01" value="4.81" /></label>
+        <label>Cycles / K <input id="cycles_per_K" type="number" step="1" value="14" /></label>
+        <label>Accel (mm/s²) <input id="accel_mm_s2" type="number" step="50" value="5000" /></label>
+      </div>
+      <div class="row">
+        <label>K min <input id="k_min" type="number" step="0.001" value="0.000" /></label>
+        <label>K max <input id="k_max" type="number" step="0.001" value="0.100" /></label>
+        <label>K step <input id="k_step" type="number" step="0.001" value="0.002" /></label>
+      </div>
+      <div class="row">
+        <label>Purge X <input id="purge_x" type="number" step="1" value="30" /></label>
+        <label>Purge Y <input id="purge_y" type="number" step="1" value="30" /></label>
+        <label>Purge Z <input id="purge_z" type="number" step="1" value="50" /></label>
+      </div>
+      <div class="row">
+        <label>Coupled ΔX (mm) <input id="coupled_dx_mm" type="number" step="0.01" value="0.05" /></label>
+        <label>Coupled ΔY (mm) <input id="coupled_dy_mm" type="number" step="0.01" value="0.00" /></label>
+        <label>Coupled ΔZ (mm) <input id="coupled_dz_mm" type="number" step="0.01" value="0.00" /></label>
+      </div>
+      <div class="row">
+        <label title="K[0] cycle 0's first slow extrusion is multiplied by this factor so it both purges old filament and establishes steady-state melt pressure before the first slow→fast transition. Replaces the legacy 2 mm prime + 500 ms dwell. Set to 1 to disable.">
+          First slow-leg factor (warm-up)
+          <input id="first_slow_leg_factor" type="number" step="0.5" min="1" value="10" />
+        </label>
+      </div>
+    </section>
+
+    <section class="card actions">
+      <button id="btn_save" type="button">Save config</button>
+      <button id="btn_preview" type="button">Preview G-code</button>
+      <button id="btn_run" type="button" class="primary">Start tuning run</button>
+      <button id="btn_cancel" type="button" class="danger">Cancel</button>
+      <label class="replay-picker">Replay a saved run
+        <select id="runs_select"><option value="">— select —</option></select>
+        <div id="run_meta" class="meta" style="margin-top:4px; font-size: 0.85em;"></div>
+      </label>
+      <button id="btn_replay_refresh" type="button">↻</button>
+    </section>
+
+    <section class="card">
+      <h2>Live loadcell</h2>
+      <div id="live_plot" style="width:100%;height:300px;"></div>
+      <div class="status">
+        <span id="status_state">idle</span> ·
+        <span id="status_msg"></span> ·
+        K=<span id="status_k">—</span> ·
+        <span id="status_pct">0</span>%
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>bd_pressure segment browser</h2>
+      <div class="meta">
+        Step through every low-high-low segment (low_n + high_n + low_{n+1})
+        and inspect what the analyser saw. Click a K on the left to focus it;
+        use prev/next buttons or ← / → keys to step through that K's segments.
+        Segments excluded by the auto-quality gate are flagged with the reason.
+      </div>
+      <div id="bd_browser" class="bd-browser">
+        <div id="bd_k_list" class="bd-k-list"></div>
+        <div class="bd-segment-pane">
+          <div class="bd-segment-header">
+            <div class="bd-segment-nav">
+              <button id="bd_prev" type="button" title="prev segment (←)">◀</button>
+              <span id="bd_segment_label">no run loaded</span>
+              <button id="bd_next" type="button" title="next segment (→)">▶</button>
+            </div>
+            <div id="bd_excluded_banner" class="bd-excluded" style="display:none;"></div>
+            <div class="bd-overlay-toggles">
+              <label><input type="checkbox" id="bd_overlay_transitions" checked> transitions</label>
+              <label><input type="checkbox" id="bd_overlay_levels" checked> baseline/plateau</label>
+              <label><input type="checkbox" id="bd_overlay_peaks" checked> peak/trough</label>
+              <label><input type="checkbox" id="bd_overlay_regions"> R1..R8 shading</label>
+              <label><input type="checkbox" id="bd_overlay_areas"> area fills</label>
+              <label><input type="checkbox" id="bd_overlay_slope"> plateau slope</label>
+              <label><input type="checkbox" id="bd_overlay_labels"> numeric labels</label>
+            </div>
+          </div>
+          <div id="bd_segment_plot" style="width:100%;height:320px;"></div>
+          <div id="bd_segment_stats" class="bd-stats"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Loadcell baseline (pre-sweep)</h2>
+      <div class="meta">
+        Held-idle window captured after heat-up, before priming. Mean is
+        the static head load; std is the noise floor; drift is the
+        difference between the 2nd-half and 1st-half means (high drift =
+        thermal not yet settled). If mean ≈ 0, the firmware tared; if not,
+        analysis still works (per-window mean-subtraction handles it) but
+        an absolute scale becomes unreadable.
+      </div>
+      <div class="row baseline">
+        <div><span class="meta">mean</span><div id="baseline_mean" class="big small">—</div></div>
+        <div><span class="meta">std</span><div id="baseline_std" class="big small">—</div></div>
+        <div><span class="meta">drift</span><div id="baseline_drift" class="big small">—</div></div>
+        <div><span class="meta">samples</span><div id="baseline_n" class="big small">—</div></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Results — bd_pressure step-response cost</h2>
+      <div class="meta">
+        Composite cost = weighted sum of normalised per-K metrics
+        (median over included segments). Sliders adjust weights live —
+        K_opt recomputes without re-running the printer. The per-metric
+        K_opts on the right show whether the metrics agree.
+      </div>
+      <div class="row" style="align-items:flex-start;">
+        <div class="result-block" style="flex:2 1 360px;">
+          <h3>Recommended K (composite argmin)</h3>
+          <div id="bd_k_opt_display" class="big">—</div>
+          <div class="meta">parabolic interp around the cost minimum</div>
+          <div class="bd-weight-sliders" id="bd_weight_sliders"></div>
+          <div id="bd_cost_plot" style="width:100%;height:240px;"></div>
+        </div>
+        <div class="result-block" style="flex:1 1 220px;">
+          <h3>per-metric K_opt</h3>
+          <div class="meta">argmin of each metric in isolation</div>
+          <table id="bd_per_metric_table" class="bd-metric-table"></table>
+        </div>
+      </div>
+      <div id="bd_metric_grid" class="bd-metric-grid"></div>
+    </section>
+
+    <section class="card">
+      <h2>Results — linear-fit zero-crossing (comparison)</h2>
+      <div class="meta">
+        U1/Snapmaker-style metrics. The integral-area fit uses a 150 ms
+        transition window (≈ one melt-pressure τ) and a per-cycle local
+        mean, and now consumes the SAME bd_pressure-built cycle list, so
+        a cycle the bd analysis excluded (dropouts in the critical zone,
+        sample rate &lt; 40 Hz, signal-below-noise) is excluded here too.
+        Hover a point to see how many cycles survived for that K. Phase-lag
+        and legacy-integral are kept for visual comparison only.
+      </div>
+      <div class="row">
+        <div class="result-block">
+          <h3>Phase-lag fit</h3>
+          <div id="phase_k_opt" class="big">—</div>
+          <div class="meta">slope=<span id="phase_slope">—</span> · R²=<span id="phase_r2">—</span></div>
+          <div id="phase_plot" style="width:100%;height:240px;"></div>
+        </div>
+        <div class="result-block">
+          <h3>Integral-area fit (centered)</h3>
+          <div id="integral_k_opt" class="big">—</div>
+          <div class="meta">slope=<span id="integral_slope">—</span> · R²=<span id="integral_r2">—</span></div>
+          <div id="integral_plot" style="width:100%;height:240px;"></div>
+        </div>
+        <div class="result-block">
+          <h3>Integral (legacy sign(dC/dt))</h3>
+          <div id="integral_legacy_k_opt" class="big">—</div>
+          <div class="meta">slope=<span id="integral_legacy_slope">—</span> · R²=<span id="integral_legacy_r2">—</span></div>
+          <div id="integral_legacy_plot" style="width:100%;height:240px;"></div>
+        </div>
+      </div>
+      <div id="notes" class="notes"></div>
+      <div class="row">
+        <button id="btn_copy" type="button">Copy M572 S…</button>
+        <span id="copy_status" class="meta"></span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Diagnostics</h2>
+      <div class="meta">
+        Live UDP stats (auto-refreshes every second). If a metric you M331'd is
+        missing or running at ~0 Hz, that name probably doesn't exist on this
+        firmware build — the M331 handler writes "Metric not found" to serial
+        and PrusaLink discards the reply, so the failure is invisible from
+        gcode. <strong>Throttle is compile-time</strong> (the 4th arg of
+        each <code>METRIC_DEF</code>); M331/M332 can only enable/disable, not
+        re-rate. Power-cycling the printer reverts every metric to its
+        compile-time enable/disable default.
+      </div>
+      <div class="row baseline">
+        <div><span class="meta">packets / s</span><div id="diag_pkt_rate" class="big small">—</div></div>
+        <div><span class="meta">packets (total)</span><div id="diag_pkts" class="big small">—</div></div>
+        <div><span class="meta">dropped (backpressure)</span><div id="diag_dropped" class="big small">—</div></div>
+        <div><span class="meta">malformed lines</span><div id="diag_malformed" class="big small">—</div></div>
+        <div><span class="meta">metric names seen</span><div id="diag_n_metrics" class="big small">—</div></div>
+      </div>
+      <table id="diag_rates_table" style="width:100%;margin-top:8px;border-collapse:collapse;">
+        <thead>
+          <tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid #2a2f37;">metric</th>
+              <th style="text-align:right;padding:4px 8px;border-bottom:1px solid #2a2f37;">Hz (last 5s)</th>
+              <th style="text-align:right;padding:4px 8px;border-bottom:1px solid #2a2f37;">total samples</th></tr>
+        </thead>
+        <tbody id="diag_rates_body"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

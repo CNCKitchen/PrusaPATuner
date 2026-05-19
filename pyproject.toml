@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prusa-pa-tuner"
+version = "0.1.0"
+description = "Automatic Linear Advance tuner for the Prusa Core One using the nozzle loadcell over UDP"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Stefan Hermann (CNC Kitchen)" }]
+license = { text = "AGPL-3.0-or-later" }
+license-files = ["LICENSE"]
+keywords = ["3d-printing", "prusa", "core-one", "linear-advance", "pressure-advance", "calibration"]
+classifiers = [
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+    "Development Status :: 3 - Alpha",
+]
+
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "httpx>=0.27",
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.3",
+]
+package = [
+    "pyinstaller>=6.5",
+]
+
+[project.scripts]
+prusa-pa-tuner = "prusa_pa_tuner.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+prusa_pa_tuner = ["static/*", "templates/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
