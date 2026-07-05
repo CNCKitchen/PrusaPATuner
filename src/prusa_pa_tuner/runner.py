@@ -672,10 +672,18 @@ async def run_tuning(
             #   wall_unix(sample) = mono_anchor_unix + (sample.mono - mono_anchor_mono)
             mono_anchor_mono = time.monotonic()
             mono_anchor_unix = time.time()
+            # Deterministic packet-loss log from msg= sequence gaps
+            # (see MetricStream.loss_events). Empty arrays when the
+            # stream never saw syslog-wrapped packets.
+            loss = stream.loss_events()
+            loss_t = np.array([t for t, _ in loss], dtype=float)
+            loss_n = np.array([n for _, n in loss], dtype=float)
             np.savez(
                 dump_path,
                 force_t=force_t,
                 force_y=force_y,
+                loss_t=loss_t,
+                loss_n=loss_n,
                 pos_t=pos_t if pos_t is not None else np.array([]),
                 pos_x=pos_x if pos_x is not None else np.array([]),
                 pos_y_t=np.asarray(run.pos_y_t, dtype=float),

@@ -2,7 +2,11 @@ import asyncio
 
 import pytest
 
-from prusa_pa_tuner.udp_metrics import MetricStream, parse_line
+from prusa_pa_tuner.udp_metrics import (
+    FirmwareClockMapper,
+    MetricStream,
+    parse_line,
+)
 
 
 def test_simple_value():
@@ -257,6 +261,175 @@ def test_packet_overlap_falls_back_to_uniform_to_keep_monotonic():
     # 100.005, 100.010, 100.015.
     # The exact values depend on the spread formula; the strict
     # monotonicity test above is what actually matters.
+
+
+def test_syslog_header_meta_is_captured():
+    """msg= (packet sequence) and tm= (firmware clock) from the syslog
+    header must ride along on the parsed sample -- they are the raw
+    material for firmware-timebase reconstruction and deterministic
+    packet-loss detection."""
+    line = (
+        "<14>1 - 10:9c:70:2b:7a:6b buddy - - - "
+        "msg=51136,tm=2259369059,v=4 loadcell_value v=-17933.166016 -4191"
+    )
+    s = parse_line(line)
+    assert s is not None
+    assert s.fw_seq == 51136
+    assert s.fw_tm == 2259369059
+    # Raw (unwrapped) lines carry no header meta.
+    s2 = parse_line("loadcell_value v=1.0 -100")
+    assert s2.fw_seq is None
+    assert s2.fw_tm is None
+
+
+def test_fw_clock_mapper_calibrates_microseconds():
+    """Feed anchors whose tm advances 1e6 ticks per host second -- the
+    mapper must detect the µs unit and map tm to host time within the
+    jitter envelope (offset = sliding min of recv - tm*scale)."""
+    m = FirmwareClockMapper()
+    base_tm = 2_000_000_000
+    # 30 packets over 3 s, with +0..5 ms of simulated network jitter.
+    jitter = [0.005, 0.001, 0.003, 0.0, 0.002] * 6
+    mapped = None
+    for i in range(30):
+        tm = base_tm + i * 100_000  # 100 ms of firmware time per packet
+        recv = 500.0 + i * 0.1 + jitter[i]
+        mapped = m.add_anchor(tm, recv)
+    assert m.state.startswith("calibrated")
+    assert "1e-06" in m.state
+    # The zero-jitter anchor (recv delay 0.0) pins the offset, so the
+    # final mapped time equals the jitter-free arrival time.
+    assert mapped == pytest.approx(500.0 + 29 * 0.1, abs=1e-6)
+
+
+def test_fw_clock_mapper_rejects_unknown_unit():
+    """A tm that advances at a rate matching no known unit (here 3x
+    faster than µs) must disable the mapper after the give-up span,
+    so dispatch falls back to host-arrival timestamps."""
+    m = FirmwareClockMapper()
+    for i in range(200):
+        m.add_anchor(1000 + i * 300_000, 500.0 + i * 0.1)
+    assert m.state == "disabled"
+    assert m.map(999_999.0) is None
+
+
+def test_fw_clock_mapper_unwraps_32bit_rollover():
+    """A µs counter wraps every ~71.6 min. When tm jumps backwards by
+    more than half the 32-bit range, the mapper must unwrap instead of
+    resetting, and mapped time must stay continuous."""
+    m = FirmwareClockMapper()
+    wrap = 2 ** 32
+    start = wrap - 15 * 100_000  # 15 packets before rollover
+    recv0 = 500.0
+    t_mid = None
+    t_last = None
+    for i in range(30):
+        tm = (start + i * 100_000) % wrap  # wraps at i == 15
+        t = m.add_anchor(tm, recv0 + i * 0.1)
+        if i == 25:
+            t_mid = t
+        if i == 29:
+            t_last = t
+    # Calibration completes at i>=20 (MIN_PAIRS + 2 s span), which is
+    # AFTER the rollover at i==15 -- so a successful calibration here
+    # proves the unwrap kept the tm sequence linear across the wrap.
+    assert m.state.startswith("calibrated")
+    assert t_mid is not None and t_last is not None
+    # Mapped time keeps advancing at exactly 100 ms per packet across
+    # the post-wrap region.
+    assert t_last - t_mid == pytest.approx(0.4, abs=1e-6)
+
+
+def test_packet_with_fw_clock_uses_firmware_timebase():
+    """Once the mapper is calibrated, sample timestamps must come from
+    tm= + per-line offsets: two packets whose HOST arrival jitters but
+    whose firmware clock is perfectly regular must produce regularly
+    spaced samples (the whole point of the firmware timebase)."""
+    stream = MetricStream(port=0)
+    captured: list[float] = []
+
+    import prusa_pa_tuner.udp_metrics as udp_mod
+    original_monotonic = udp_mod.time.monotonic
+
+    def syslog(seq: int, tm: int, name: str, val: float, off: int) -> bytes:
+        return (
+            f"<14>1 - mac buddy - - - msg={seq},tm={tm},v=4 "
+            f"{name} v={val} {off}"
+        ).encode()
+
+    try:
+        # Calibration phase: 30 packets 100 ms apart with 0..5 ms of
+        # network delay (at least one zero-delay packet pins the
+        # offset's sliding minimum at the true clock offset). The two
+        # measurement packets then arrive with +20 ms and +30 ms delay
+        # -- delays are always >= 0, matching physical reality.
+        jitter = [0.005, 0.001, 0.003, 0.0, 0.002] * 6
+        t_host = iter(
+            [100.0 + i * 0.1 + jitter[i] for i in range(30)]
+            + [103.02, 103.13]
+        )
+        udp_mod.time.monotonic = lambda: next(t_host)
+        base_tm = 50_000_000
+        for i in range(30):
+            stream._on_packet(
+                syslog(i, base_tm + i * 100_000, "loadcell_value", 1.0, 0),
+                ("t", 0),
+            )
+        assert stream._fw_clock.state.startswith("calibrated")
+
+        original_dispatch = stream._dispatch
+        def capture(sample):
+            captured.append(sample.recv_monotonic)
+            return original_dispatch(sample)
+        stream._dispatch = capture
+
+        # Packet A (arrives +20 ms) and B (arrives +30 ms): the host
+        # sees them 110 ms apart, but the firmware clock says exactly
+        # 100 ms apart, each with 2 samples 5 ms apart.
+        tm_a = base_tm + 30 * 100_000
+        tm_b = tm_a + 100_000
+        stream._on_packet(
+            syslog(30, tm_a, "loadcell_value", 2.0, -5000)
+            + b"\nloadcell_value v=3.0 0",
+            ("t", 0),
+        )
+        stream._on_packet(
+            syslog(31, tm_b, "loadcell_value", 4.0, -5000)
+            + b"\nloadcell_value v=5.0 0",
+            ("t", 0),
+        )
+    finally:
+        udp_mod.time.monotonic = original_monotonic
+
+    assert len(captured) == 4
+    # Intra-packet spacing: exactly 5 ms.
+    assert captured[1] - captured[0] == pytest.approx(0.005, abs=1e-6)
+    assert captured[3] - captured[2] == pytest.approx(0.005, abs=1e-6)
+    # Inter-packet spacing follows the FIRMWARE clock (100 ms), not the
+    # jittered host arrivals (60 ms apart).
+    assert captured[2] - captured[0] == pytest.approx(0.100, abs=1e-6)
+
+
+def test_seq_gap_counts_lost_packets():
+    """msg= jumping from 10 to 14 means exactly 3 packets were lost."""
+    stream = MetricStream(port=0)
+    import prusa_pa_tuner.udp_metrics as udp_mod
+    original_monotonic = udp_mod.time.monotonic
+    t_host = iter([100.0, 100.1, 100.2])
+    udp_mod.time.monotonic = lambda: next(t_host)
+    try:
+        for seq in (10, 14, 15):
+            stream._on_packet(
+                f"<14>1 - mac buddy - - - msg={seq},tm={seq * 1000},v=4 "
+                f"fan rpm=100i".encode(),
+                ("t", 0),
+            )
+    finally:
+        udp_mod.time.monotonic = original_monotonic
+    assert stream.stats["packets_lost"] == 3
+    events = stream.loss_events()
+    assert len(events) == 1
+    assert events[0] == (100.1, 3)
 
 
 def test_malformed_syslog_does_not_leak_priority_as_metric_name():

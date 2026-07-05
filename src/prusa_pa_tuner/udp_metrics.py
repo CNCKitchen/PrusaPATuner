@@ -35,6 +35,13 @@ class MetricSample:
     printer_ts_ns: int | None
     # Wall-clock receive time on this machine (monotonic seconds).
     recv_monotonic: float
+    # Syslog-header metadata, when the line arrived RFC 5424-wrapped
+    # (Metrics Port == Syslog Port setup). `fw_seq` is the firmware's
+    # per-packet message counter (`msg=N`) -- gaps mean lost packets.
+    # `fw_tm` is the firmware clock at packet emit (`tm=T`, unit
+    # auto-detected by FirmwareClockMapper). Both None on raw lines.
+    fw_seq: int | None = None
+    fw_tm: int | None = None
 
     @property
     def value(self) -> float | int | bool | str | None:
@@ -100,8 +107,28 @@ def _split_unescaped(s: str, sep: str) -> list[str]:
     return out
 
 
-def _unwrap_syslog(line: str) -> str:
-    """Strip RFC 5424 syslog framing if present, return the inner payload.
+def _parse_syslog_meta(token: str) -> tuple[int | None, int | None]:
+    """Parse `msg=51135,tm=2259318650,v=4` (syslog header token 7) into
+    (seq, tm). Either may be None when missing/unparseable."""
+    seq: int | None = None
+    tm: int | None = None
+    for part in token.split(","):
+        if part.startswith("msg="):
+            try:
+                seq = int(part[4:])
+            except ValueError:
+                pass
+        elif part.startswith("tm="):
+            try:
+                tm = int(part[3:])
+            except ValueError:
+                pass
+    return seq, tm
+
+
+def _unwrap_syslog(line: str) -> tuple[str, int | None, int | None]:
+    """Strip RFC 5424 syslog framing if present, return the inner payload
+    plus the header's (msg=seq, tm=firmware-time) metadata.
 
     Buddy/Core One emits some metrics over the syslog UDP path rather than
     the raw metric path. When Settings -> Network -> Metrics & Log routes
@@ -111,24 +138,30 @@ def _unwrap_syslog(line: str) -> str:
         <14>1 - 10:9c:70:2b:7a:6b buddy - - - msg=51135,tm=2259318650,v=4 loadcell_value v=12.3 -3693
 
     The 7th space-delimited token starts the actual InfluxDB-line-protocol
-    payload (here `loadcell_value v=12.3 -3693`).
+    payload (here `loadcell_value v=12.3 -3693`). The token before it
+    (`msg=51135,tm=2259318650,v=4`) carries the firmware's packet
+    sequence number and emit-time clock -- both load-bearing for the
+    firmware-timebase reconstruction, so they are parsed and returned
+    instead of discarded.
 
-    Returns:
-      * the original line if there is no `<PRI>` prefix at all (raw metric
-        line that needs no unwrap)
-      * the inner payload if a complete 8-header-token wrapper is detected
-      * an EMPTY string if the line LOOKS like syslog (starts with `<PRI>`)
-        but the wrapper is truncated/malformed -- previously we returned
-        the raw line in this case and `parse_line` then registered the
-        priority prefix (e.g. `<14>1`) as a fake metric name, which polluted
-        the diagnostics table and `/api/metrics_seen` output. Returning ""
-        signals "skip this line entirely" via parse_line's empty-line guard.
+    Returns `(payload, seq, tm)`:
+      * `(line, None, None)` if there is no `<PRI>` prefix at all (raw
+        metric line that needs no unwrap)
+      * `(inner_payload, seq, tm)` if a complete 8-header-token wrapper
+        is detected
+      * `("", None, None)` if the line LOOKS like syslog (starts with
+        `<PRI>`) but the wrapper is truncated/malformed -- previously we
+        returned the raw line in this case and `parse_line` then
+        registered the priority prefix (e.g. `<14>1`) as a fake metric
+        name, which polluted the diagnostics table and
+        `/api/metrics_seen` output. Returning "" signals "skip this line
+        entirely" via parse_line's empty-line guard.
     """
     if not line or line[0] != "<":
-        return line
+        return line, None, None
     close = line.find(">")
     if close < 0 or close > 5:
-        return line
+        return line, None, None
     # 5424 header: <PRI>VER SP TIMESTAMP SP HOSTNAME SP APPNAME SP PROCID
     # SP MSGID SP STRUCTURED-DATA SP MSG. Buddy emits:
     #   <14>1 - <mac> buddy - - - msg=N,tm=T,v=V <inner-influx-line>
@@ -139,8 +172,9 @@ def _unwrap_syslog(line: str) -> str:
         # Looked like a syslog wrapper but the header is incomplete.
         # Do NOT pass through -- the `<PRI>VER` prefix would otherwise be
         # parsed as the metric name.
-        return ""
-    return parts[8]
+        return "", None, None
+    seq, tm = _parse_syslog_meta(parts[7])
+    return parts[8], seq, tm
 
 
 def parse_line(line: str, recv_monotonic: float | None = None) -> MetricSample | None:
@@ -152,8 +186,9 @@ def parse_line(line: str, recv_monotonic: float | None = None) -> MetricSample |
         recv_monotonic = time.monotonic()
 
     # If this is a syslog-framed copy (Metrics Port == Syslog Port), strip
-    # the syslog header so we see the actual metric payload.
-    line = _unwrap_syslog(line)
+    # the syslog header so we see the actual metric payload. The header's
+    # msg=/tm= metadata rides along on the sample.
+    line, fw_seq, fw_tm = _unwrap_syslog(line)
     if not line:
         return None
 
@@ -200,7 +235,122 @@ def parse_line(line: str, recv_monotonic: float | None = None) -> MetricSample |
         fields=fields,
         printer_ts_ns=ts_ns,
         recv_monotonic=recv_monotonic,
+        fw_seq=fw_seq,
+        fw_tm=fw_tm,
     )
+
+
+class FirmwareClockMapper:
+    """Map the firmware's `tm=` clock to host monotonic time.
+
+    Why: every downstream alignment problem (window slicing, pos_x vs
+    loadcell cross-stream sync) stems from timestamps reconstructed
+    from host UDP arrival times, which carry Wi-Fi jitter and packet
+    batching. The firmware's own clock has none of that -- two samples
+    1 ms apart in firmware time really were 1 ms apart. This mapper
+    turns raw `tm` ticks into host-monotonic seconds so all metric
+    streams share one consistent, jitter-free timebase.
+
+    Method:
+      * The tick unit is auto-detected (s / ms / µs / ns) by comparing
+        the tm span against the host-clock span over a calibration
+        window. If no candidate unit matches, the mapper disables
+        itself and callers fall back to host-arrival timestamps.
+      * The offset is the sliding-window MINIMUM of
+        `recv - tm * scale`: network delay is always >= the minimum
+        observed delay, so the min tracks the true offset from below.
+        The window (default 512 packets, ~1 min at Buddy's ~7 pkt/s)
+        also absorbs crystal drift between printer and host
+        (~1e-5 -> well under 1 ms over the window).
+      * 32-bit wraparound (a µs counter wraps every ~71.6 min --
+        within one long sweep) is unwrapped when tm jumps backwards by
+        more than half the 32-bit range; a smaller backward jump means
+        the printer rebooted and the mapper resets.
+    """
+
+    SCALE_CANDIDATES = (1.0, 1e-3, 1e-6, 1e-9)  # seconds per tick
+    SCALE_TOLERANCE = 0.25  # accept ratio within ±25% of a candidate
+    MIN_PAIRS = 20
+    MIN_SPAN_S = 2.0
+    GIVE_UP_SPAN_S = 15.0  # no candidate matched after this long → disable
+    WRAP = 2 ** 32
+
+    def __init__(self, window: int = 512):
+        self._pairs: deque[tuple[float, float]] = deque(maxlen=window)
+        self._scale: float | None = None  # None=calibrating, 0.0=disabled
+        self._last_raw_tm: int | None = None
+        self._wrap_offset: int = 0
+
+    @property
+    def state(self) -> str:
+        if self._scale is None:
+            return "calibrating"
+        if self._scale == 0.0:
+            return "disabled"
+        return f"calibrated (1 tick = {self._scale:g} s)"
+
+    def reset(self) -> None:
+        self._pairs.clear()
+        self._scale = None
+        self._last_raw_tm = None
+        self._wrap_offset = 0
+
+    def add_anchor(self, tm: int, recv: float) -> float | None:
+        """Feed one (firmware tm, host recv) pair; returns the mapped
+        host-monotonic emit time, or None while uncalibrated/disabled."""
+        if self._last_raw_tm is not None and tm < self._last_raw_tm:
+            back = self._last_raw_tm - tm
+            if back > self.WRAP // 2:
+                # Counter wrapped (uint32 µs wraps every ~71.6 min).
+                self._wrap_offset += self.WRAP
+            else:
+                # Firmware clock went backwards without wrapping --
+                # printer reboot. Start over.
+                log.warning(
+                    "firmware clock went backwards (%d -> %d); "
+                    "printer reboot assumed, resetting clock mapper",
+                    self._last_raw_tm, tm,
+                )
+                self.reset()
+        self._last_raw_tm = tm
+        tmu = float(tm + self._wrap_offset)
+        self._pairs.append((tmu, recv))
+        if self._scale is None:
+            self._try_calibrate()
+        return self.map(tmu)
+
+    def _try_calibrate(self) -> None:
+        if len(self._pairs) < self.MIN_PAIRS:
+            return
+        tm0, r0 = self._pairs[0]
+        tm1, r1 = self._pairs[-1]
+        host_span = r1 - r0
+        if host_span < self.MIN_SPAN_S or tm1 <= tm0:
+            return
+        ratio = host_span / (tm1 - tm0)
+        for cand in self.SCALE_CANDIDATES:
+            if abs(ratio / cand - 1.0) <= self.SCALE_TOLERANCE:
+                self._scale = cand
+                log.info(
+                    "firmware clock calibrated: 1 tick = %g s "
+                    "(ratio %.3g over %.1f s / %d packets)",
+                    cand, ratio, host_span, len(self._pairs),
+                )
+                return
+        if host_span > self.GIVE_UP_SPAN_S:
+            self._scale = 0.0
+            log.warning(
+                "firmware clock unit unrecognised (ratio %.3g s/tick); "
+                "falling back to host-arrival timestamps", ratio,
+            )
+
+    def map(self, tm_unwrapped: float) -> float | None:
+        """Unwrapped firmware ticks → host monotonic seconds."""
+        if not self._scale:
+            return None
+        s = self._scale
+        offset = min(r - t * s for t, r in self._pairs)
+        return tm_unwrapped * s + offset
 
 
 class MetricStream:
@@ -253,6 +403,19 @@ class MetricStream:
         # by clipping each new sample's recv_monotonic to be strictly
         # greater than the previous dispatched sample for this metric.
         self._last_metric_sample_t: dict[str, float] = {}
+        # Firmware timebase reconstruction. When lines arrive syslog-
+        # wrapped (Metrics Port == Syslog Port), each packet carries
+        # msg=<seq> and tm=<firmware clock>. The mapper converts tm to
+        # host-monotonic time so sample timestamps come from the
+        # firmware's jitter-free clock instead of UDP arrival times.
+        self._fw_clock = FirmwareClockMapper()
+        self._last_fw_seq: int | None = None
+        # Packet-loss accounting from msg= sequence gaps. Deterministic,
+        # unlike the analyser's time-gap heuristics. `_loss_events`
+        # holds (host_monotonic, n_lost) so runners can dump them
+        # alongside the sample streams.
+        self._packets_lost = 0
+        self._loss_events: deque[tuple[float, int]] = deque(maxlen=4096)
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -286,17 +449,80 @@ class MetricStream:
         # This is what makes the live plot render as a continuous line
         # instead of vertical clusters every ~140 ms.
         by_name: dict[str, list[MetricSample]] = {}
+        packet_seq: int | None = None
+        packet_tm: int | None = None
         for line in text.splitlines():
             sample = parse_line(line, recv)
             if sample is None:
                 if line.strip():
                     self._malformed += 1
                 continue
+            if packet_seq is None and sample.fw_seq is not None:
+                packet_seq = sample.fw_seq
+            if sample.fw_tm is not None:
+                # If each line carries its own header, keep the newest tm
+                # (= the packet's emit instant); if only the first line is
+                # wrapped, this is simply that line's tm.
+                packet_tm = (
+                    sample.fw_tm if packet_tm is None
+                    else max(packet_tm, sample.fw_tm)
+                )
             by_name.setdefault(sample.name, []).append(sample)
+
+        # Sequence-gap accounting: msg= increments once per packet, so a
+        # jump of N+1 means exactly N packets were lost on the network.
+        if packet_seq is not None:
+            if self._last_fw_seq is not None:
+                gap = packet_seq - self._last_fw_seq - 1
+                if 0 < gap < 10_000:
+                    self._packets_lost += gap
+                    self._loss_events.append((recv, gap))
+                elif packet_seq < self._last_fw_seq:
+                    # Counter went backwards -- printer reboot / counter
+                    # reset. Don't count it as loss.
+                    log.info(
+                        "metric seq counter reset (%d -> %d)",
+                        self._last_fw_seq, packet_seq,
+                    )
+            self._last_fw_seq = packet_seq
+
+        # Firmware-clock emit time for this packet. Once the mapper is
+        # calibrated this is the preferred timestamp anchor: it removes
+        # host-arrival jitter entirely and keeps ALL metric streams on
+        # one mutually-consistent timebase.
+        fw_emit_t: float | None = None
+        if packet_tm is not None:
+            fw_emit_t = self._fw_clock.add_anchor(packet_tm, recv)
+            # Sanity: the mapped emit time must not sit in the future
+            # of the packet's arrival (delay is non-negative) nor
+            # implausibly far in the past. Outside that band the
+            # calibration is off -- fall back to arrival-anchored paths.
+            if fw_emit_t is not None and not (
+                recv - 5.0 <= fw_emit_t <= recv + 0.05
+            ):
+                fw_emit_t = None
+
         for name, batch in by_name.items():
             last = self._last_metric_recv.get(name)
             self._last_metric_recv[name] = recv
             n = len(batch)
+            # PREFERRED: firmware-clock timestamps. Anchor at the mapped
+            # emit instant and apply each line's µs offset. Unlike the
+            # recv-anchored paths below this is jitter-free AND
+            # consistent across metrics: a loadcell sample and a pos_x
+            # sample with the same firmware time get the same host
+            # timestamp, which is what the analyser's cross-stream
+            # alignment ultimately relies on.
+            if fw_emit_t is not None:
+                for s in batch:
+                    off_us = s.printer_ts_ns  # µs offset despite the name
+                    t = (
+                        fw_emit_t + float(off_us) / 1e6
+                        if off_us is not None
+                        else fw_emit_t
+                    )
+                    self._dispatch_monotonic(name, s, t)
+                continue
             if n == 1 or last is None or recv <= last:
                 # Trivial case or first packet for this metric -- leave the
                 # timestamp at recv.
@@ -434,14 +660,25 @@ class MetricStream:
             self._rings.pop(name, None)
 
     @property
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, int | str]:
         return {
             "packets": self._packets_received,
             "malformed_lines": self._malformed,
             "metrics_seen": len(self._rings),
             "samples_total": sum(len(r) for r in self._rings.values()),
             "dropped_backpressure": self._dropped_backpressure,
+            # Deterministic packet loss from msg= sequence gaps -- the
+            # ground truth the analyser's time-gap heuristics only
+            # approximate. Non-zero during a run means real UDP loss.
+            "packets_lost": self._packets_lost,
+            "fw_clock": self._fw_clock.state,
         }
+
+    def loss_events(self) -> list[tuple[float, int]]:
+        """(host_monotonic, n_packets_lost) for every msg= sequence gap
+        seen so far. Runners dump these next to the sample streams so
+        offline analysis can exclude windows around real packet loss."""
+        return list(self._loss_events)
 
     def metric_rates(self, window_s: float = 5.0) -> dict[str, float]:
         """Per-metric samples/sec over the last `window_s` seconds.
