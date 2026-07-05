@@ -13,7 +13,7 @@ UDP target can't override ours. See project_live_map_module memory.
 """
 from __future__ import annotations
 
-from .gcode_gen import METRICS_TO_SILENCE
+from .gcode_preamble import metric_setup
 
 
 def build_livemap_gcode(
@@ -30,18 +30,24 @@ def build_livemap_gcode(
     pre: list[str] = []
     pre.append("; --- PrusaPATuner Live Map preamble (injected) ---")
     pre.append("; geometry below is the user's sliced gcode, untouched.")
-    pre.append(f"M334 {udp_host} {udp_port} ; stream metrics to host")
-    pre.append("; silence non-essential metrics to lower UDP load")
-    for m in METRICS_TO_SILENCE:
-        pre.append(f"M332 {m}")
     # The four streams Live Map maps onto the gcode preview. loadcell_value is
     # the nozzle force; pos_x/y/z place each force sample in the print (and on
     # the same recv_monotonic host clock as the force, so they're inherently
     # time-aligned -- the whole point of the streamed-position approach).
-    pre.append(f"M331 {loadcell_metric} ; nozzle force")
-    pre.append("M331 pos_x ; toolhead X")
-    pre.append("M331 pos_y ; toolhead Y")
-    pre.append("M331 pos_z ; toolhead Z (layer)")
+    metric_setup(
+        pre,
+        udp_host=udp_host,
+        udp_port=udp_port,
+        enables=[
+            (loadcell_metric, "nozzle force"),
+            ("pos_x", "toolhead X"),
+            ("pos_y", "toolhead Y"),
+            ("pos_z", "toolhead Z (layer)"),
+        ],
+        silence_header="; silence non-essential metrics to lower UDP load",
+        blank_after_silence=False,
+        blank_after_enables=False,
+    )
     pre.append("; --- end Live Map preamble ---")
     pre.append("")
 
