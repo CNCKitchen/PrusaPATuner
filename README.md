@@ -278,6 +278,25 @@ own known-good K and let the built-in weight optimiser fit the weights to it.
 Raw run data is saved to `runs/run_<timestamp>.npz` (gitignored by default). Use
 `scripts/replay_run.py` to re-analyse old runs without re-printing.
 
+### macOS: Dock / desktop launcher (optional)
+
+If you'd rather double-click an icon than keep a terminal open, build a small
+launcher app once the install above is done:
+
+```bash
+scripts/make_macos_app.sh --desktop
+```
+
+This creates `~/Applications/Prusa PA Tuner.app` (and, with `--desktop`, a shortcut
+on the Desktop). Double-clicking it starts the server from this checkout's `.venv`
+and opens the UI in your default browser; clicking the Dock icon opens the UI
+again; quitting the app (Cmd+Q) stops the server. Closing the browser tab does
+*not* stop it. Server output goes to `~/Library/Logs/PrusaPATuner.log`.
+
+The app is a thin wrapper around this checkout, not a standalone bundle — if you
+move the folder or recreate the venv, run the script again. It only uses tools
+that ship with macOS.
+
 ## Beyond PA: the other modules
 
 The web UI has four modes, toggled at the top of the page. All of them reuse the
@@ -368,6 +387,8 @@ scripts/
   examine_sg.py     # stationary-extrude force capture
   npz2xlsx.py       # convert a saved run .npz to a spreadsheet
   bootstrap_sanity.py # sanity checks for the optimiser's segment bootstrap
+  make_macos_app.sh # build the optional macOS launcher app
+packaging/macos/    # launcher applet source + icon for make_macos_app.sh
 tests/              # pytest
 ```
 
