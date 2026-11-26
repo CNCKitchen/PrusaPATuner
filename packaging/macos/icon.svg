@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a2f3a"/>
+      <stop offset="1" stop-color="#14171d"/>
+    </linearGradient>
+    <linearGradient id="noz" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffb347"/>
+      <stop offset="1" stop-color="#f7931e"/>
+    </linearGradient>
+  </defs>
+  <!-- macOS-style rounded tile with margin -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="none" stroke="#3b4250" stroke-width="6"/>
+
+  <!-- nozzle -->
+  <rect x="402" y="190" width="220" height="70" rx="14" fill="#8b93a3"/>
+  <rect x="432" y="260" width="160" height="80" fill="url(#noz)"/>
+  <path d="M432 340 L592 340 L536 430 L488 430 Z" fill="url(#noz)"/>
+  <!-- filament strand -->
+  <rect x="503" y="430" width="18" height="70" rx="9" fill="#f7931e"/>
+
+  <!-- grid baseline -->
+  <path d="M200 760 H824" stroke="#3b4250" stroke-width="8" stroke-linecap="round"/>
+  <path d="M200 600 H824" stroke="#3b4250" stroke-width="6" stroke-linecap="round" stroke-dasharray="4 26"/>
+
+  <!-- step response: commanded (grey) and measured with overshoot (orange) -->
+  <path d="M200 760 H400 V600 H640 V760 H824" fill="none" stroke="#6b7385" stroke-width="14" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M200 760 H392 C410 760 414 560 440 560 C462 560 468 612 500 604 C540 596 600 600 632 600 C652 600 656 800 682 800 C704 800 712 752 740 758 C770 762 800 760 824 760"
+        fill="none" stroke="#f7931e" stroke-width="20" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>
